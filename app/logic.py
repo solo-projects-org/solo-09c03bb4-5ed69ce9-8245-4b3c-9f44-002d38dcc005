@@ -24,6 +24,7 @@ HEADER_ALIASES = {
     "license_no": ["license_no", "license", "授权号", "授权编号"],
     "commercial": ["commercial", "是否允许商用", "允许商用", "商用"],
     "attribution": ["attribution", "署名", "署名信息"],
+    "pdf_file": ["pdf_file", "pdf_filename", "pdf", "pdf文件名", "PDF文件名", "扫描件", "扫描件文件名"],
 }
 
 TRUE_WORDS = {"1", "true", "yes", "y", "是", "允许", "允许商用", "可商用", "商用"}

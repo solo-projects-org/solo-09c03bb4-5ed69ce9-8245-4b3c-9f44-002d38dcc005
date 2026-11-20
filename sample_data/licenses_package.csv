@@ -1,0 +1,8 @@
+授权号,原图号,是否允许商用,署名,PDF文件名
+LIC-001,ORG-001,是,摄影：张三,scan_org001.pdf
+LIC-002,ORG-001,是,摄影：张三,scan_org001.pdf
+LIC-003,ORG-002,是,摄影：李四,scan_org002.pdf
+LIC-004,ORG-002,是,© 某图库,scan_org002.pdf
+LIC-005,ORG-003,是,摄影：王五,scan_org003.pdf
+LIC-006,ORG-003,否,摄影：王五,scan_org003.pdf
+LIC-007,ORG-004,是,摄影：赵六,scan_org004.pdf

@@ -69,6 +69,35 @@ CREATE TABLE IF NOT EXISTS confirmations (
     detail TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
 );
+
+-- 扫描件内容按 SHA-256 去重：同一份 PDF 被多条授权引用时只存一行/一份文件
+CREATE TABLE IF NOT EXISTS files (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    sha256 TEXT NOT NULL UNIQUE,
+    size INTEGER NOT NULL,
+    filename TEXT NOT NULL DEFAULT '',        -- 最近一次导入时的原始文件名
+    created_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
+);
+
+-- 授权与扫描件的挂接关系
+CREATE TABLE IF NOT EXISTS license_files (
+    license_id INTEGER NOT NULL REFERENCES licenses(id),
+    file_id INTEGER NOT NULL REFERENCES files(id),
+    linked_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
+    PRIMARY KEY (license_id, file_id)
+);
+
+-- 材料包导入记录：state=committed 才对外可见
+CREATE TABLE IF NOT EXISTS import_batches (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    batch_label TEXT NOT NULL DEFAULT '',
+    state TEXT NOT NULL,                       -- imported（文件已落盘，DB 未提交）/ committed
+    pdf_count INTEGER NOT NULL DEFAULT 0,
+    new_files INTEGER NOT NULL DEFAULT 0,
+    new_licenses INTEGER NOT NULL DEFAULT 0,
+    linked INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
+);
 """
 
 

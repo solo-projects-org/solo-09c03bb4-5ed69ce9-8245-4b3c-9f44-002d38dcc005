@@ -14,7 +14,16 @@
     <input type="text" name="batch" placeholder="批次备注（可选）">
     <button type="submit">导入授权</button>
   </form>
-  <p class="muted">说明：授权号唯一，重复导入会被跳过；已撤回的授权不会因重传而恢复。</p>
+  <hr>
+  <form method="post" action="/upload/package" enctype="multipart/form-data">
+    <div><b>材料包 ZIP（扫描件 PDF + 授权 CSV）</b>
+      <span class="muted">CSV 列：授权号, 原图号, 是否允许商用, 署名, PDF文件名</span></div>
+    <input type="file" name="file" accept=".zip,application/zip" required>
+    <input type="text" name="batch" placeholder="批次备注（可选）">
+    <button type="submit">导入材料包</button>
+  </form>
+  <p class="muted">说明：包内多份扫描件按内容去重，多条授权可引用同一份 PDF。
+    缺件、同号冲突或 PDF 内容不符时整包不生效；补件/重传不恢复已撤回的授权。</p>
 </section>
 
 <section>

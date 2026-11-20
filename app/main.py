@@ -1,23 +1,29 @@
 """FastAPI 网页与接口：展图授权清单管理。"""
+import asyncio
 import csv
 import io
 import os
+import sqlite3
+import threading
 from contextlib import asynccontextmanager
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 
 from fastapi import FastAPI, HTTPException, Request, UploadFile
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response
 from fastapi.templating import Jinja2Templates
 
-from . import db, logic
+from . import db, logic, package_import, storage
 
 TEMPLATES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "templates")
 templates = Jinja2Templates(directory=TEMPLATES)
+
+MAX_UPLOAD_ZIP_MB = int(os.environ.get("EXHIBITION_MAX_ZIP_MB", "2048"))
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     db.init_db()
+    storage.cleanup_stale()
     yield
 
 
@@ -118,12 +124,24 @@ def licenses_page(request: Request):
             " LEFT JOIN exhibitions e ON e.id = mi.exhibition_id"
             " GROUP BY l.id ORDER BY l.id"
         ).fetchall()
+        file_rows = conn.execute(
+            "SELECT lf.license_id, f.id, f.filename, f.sha256"
+            " FROM license_files lf JOIN files f ON f.id = lf.file_id"
+            " ORDER BY lf.license_id, f.id").fetchall()
         conn.commit()
     finally:
         conn.close()
+    by_license = {}
+    for fr in file_rows:
+        by_license.setdefault(fr["license_id"], []).append(dict(fr))
+    licenses = []
+    for r in rows:
+        d = dict(r)
+        d["file_list"] = by_license.get(d["id"], [])
+        licenses.append(d)
     return templates.TemplateResponse(
         request=request, name="licenses.html",
-        context={"licenses": [dict(r) for r in rows], **flash_of(request)})
+        context={"licenses": licenses, **flash_of(request)})
 
 
 # ---------------------------------------------------------------- 导入
@@ -172,6 +190,178 @@ async def upload_licenses(request: Request, file: UploadFile):
     if stats["errors"]:
         return redirect("/", err=msg + "；部分行出错：" + "；".join(stats["errors"][:5]))
     return redirect("/", msg=msg)
+
+
+async def _save_upload_to_temp(file: UploadFile) -> str:
+    """把上传的 ZIP 按块写入暂存文件，避免整包读入内存。"""
+    path = storage.new_staging_file(".zip")
+    total = 0
+    limit = MAX_UPLOAD_ZIP_MB * 1024 * 1024
+    try:
+        with open(path, "wb") as out:
+            while True:
+                chunk = await file.read(storage.CHUNK_SIZE)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > limit:
+                    raise package_import.PackageError(
+                        f"材料包超过大小上限 {MAX_UPLOAD_ZIP_MB} MiB")
+                out.write(chunk)
+            out.flush()
+            os.fsync(out.fileno())
+    except BaseException:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        raise
+    return path
+
+
+def _run_package_import(zip_path: str, batch: str, cancel=None) -> dict:
+    """在校验线程中执行整包导入：先在锁外解压暂存，再在单个写事务内入库。
+
+    返回 ``{"ok": True, "stats": ...}`` 或 ``{"ok": False, "error": 原因}``；
+    意外异常按“整包不生效”回滚后向调用方抛出。``cancel`` 每处理一块调用一次，
+    客户端断开时由监视协程置位，导入随即中止并回滚。
+    """
+    published = []
+    staging_dir = storage.new_staging_dir()
+    try:
+        try:
+            referenced, pdfs = package_import.stage_package(
+                zip_path, staging_dir, cancel=cancel)
+        except package_import.PackageError as e:
+            return {"ok": False, "error": str(e)}
+        except storage.Cancelled:
+            return {"ok": False, "error": "保存中断（客户端已断开），整包未生效"}
+
+        conn = db.connect()
+        try:
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+            except sqlite3.OperationalError as e:
+                return {"ok": False, "error": f"数据库忙，请重试（{e}）"}
+            try:
+                stats = package_import.commit_staged(
+                    conn, referenced, pdfs, batch, published)
+                package_import.mark_batch_committed(conn, stats["batch_id"])
+                logic.sync_all(conn)  # 新授权与原件一并落库后，才可用于展图清单
+                conn.commit()
+                return {"ok": True, "stats": stats}
+            except package_import.PackageError as e:
+                conn.rollback()
+                return {"ok": False, "error": str(e)}
+            except storage.Cancelled:
+                conn.rollback()
+                return {"ok": False, "error": "保存中断（客户端已断开），整包未生效"}
+            except BaseException:
+                conn.rollback()
+                raise
+        finally:
+            conn.close()
+            # 成功提交后 files 表已引用这些文件，删除会被跳过；失败/中断时清理孤儿
+            package_import.remove_published(published)
+    finally:
+        storage.discard_dir(staging_dir)
+
+
+@app.post("/upload/package")
+async def upload_package(request: Request, file: UploadFile):
+    """ZIP 材料包导入：整包成功或整包不生效。
+
+    上传先按块落到暂存文件；校验与入库在写事务内完成。任何失败（缺件、
+    同号冲突、CSV 错误、客户端中断、保存异常）都会回滚数据库，并删除本次
+    新发布、未被引用的扫描件，重启后可直接重传。
+    """
+    form = await request.form()
+    batch = str(form.get("batch", "")).strip() or (file.filename or "材料包")
+    zip_path = None
+    try:
+        try:
+            zip_path = await _save_upload_to_temp(file)
+        except package_import.PackageError as e:
+            return redirect("/", err=f"材料包导入失败：{e}")
+        except asyncio.CancelledError:
+            return Response(status_code=499)
+
+        if not package_import.inspect_like_zip(zip_path):
+            return redirect("/", err="材料包导入失败：上传的文件不是有效的 ZIP 压缩包")
+
+        # 导入在线程池中执行；其间轮询客户端连接。断开即置取消标记，
+        # 导入在写事务内中止并回滚，不留下任何数据或孤儿扫描件。
+        cancel_event = threading.Event()
+        task = asyncio.get_running_loop().run_in_executor(
+            None, _run_package_import, zip_path, batch, cancel_event.is_set)
+        disconnected = False
+        try:
+            while True:
+                done, _ = await asyncio.wait({task}, timeout=0.5)
+                if done:
+                    break
+                if await request.is_disconnected():
+                    disconnected = True
+                    cancel_event.set()
+                    await asyncio.wait({task}, timeout=60)
+                    break
+        except asyncio.CancelledError:
+            # 服务取消本请求：同样让后台导入尽快回滚，等它释放数据库后再退出
+            cancel_event.set()
+            try:
+                await asyncio.wait({task}, timeout=5)
+            except BaseException:
+                pass
+            raise
+        try:
+            outcome = task.result()
+        except asyncio.CancelledError:
+            return Response(status_code=499)
+        except Exception:
+            return redirect("/", err="材料包导入失败（整包未生效）：保存中断，请重试")
+        if disconnected:
+            return Response(status_code=499)
+    except asyncio.CancelledError:
+        return Response(status_code=499)
+    finally:
+        if zip_path:
+            try:
+                os.remove(zip_path)
+            except OSError:
+                pass
+
+    if not outcome["ok"]:
+        return redirect("/", err=f"材料包导入失败（整包未生效）：{outcome['error']}")
+    stats = outcome["stats"]
+    msg = (f"材料包导入完成：扫描件 {stats['pdfs']} 个（新存 {stats['new_files']} 份），"
+           f"新增授权 {stats['new_licenses']} 条，补挂原件 {stats['linked']} 条")
+    if stats["unreferenced"]:
+        msg += f"；{stats['unreferenced']} 个扫描件未被 CSV 引用，未入库"
+    if stats["notes"]:
+        msg += "；" + "；".join(stats["notes"])
+    return redirect("/", msg=msg)
+
+
+@app.get("/licenses/{license_id}/files/{file_id}")
+def download_license_file(license_id: int, file_id: int):
+    """下载授权对应的扫描件原件（多条授权引用同一 PDF 时取同一份）。"""
+    conn = db.connect()
+    try:
+        row = conn.execute(
+            "SELECT f.* FROM license_files lf JOIN files f ON f.id = lf.file_id"
+            " JOIN licenses l ON l.id = lf.license_id"
+            " WHERE lf.license_id=? AND lf.file_id=?", (license_id, file_id)).fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail="该授权没有挂接此扫描件")
+        path = storage.final_path(row["sha256"])
+        if not os.path.isfile(path):
+            raise HTTPException(status_code=410, detail="扫描件文件缺失，请重新导入材料包")
+        filename = row["filename"] or f"{row['sha256'][:12]}.pdf"
+    finally:
+        conn.close()
+    disposition = f"attachment; filename*=UTF-8''{quote(filename, safe='')}"
+    return FileResponse(path, media_type="application/pdf",
+                        headers={"Content-Disposition": disposition})
 
 
 # ---------------------------------------------------------------- 撤回 / 确认 / 下载
@@ -312,7 +502,19 @@ def api_licenses():
             " LEFT JOIN exhibitions e ON e.id = mi.exhibition_id"
             " GROUP BY l.id ORDER BY l.id"
         ).fetchall()
+        file_rows = conn.execute(
+            "SELECT lf.license_id, f.id, f.filename, f.sha256, f.size"
+            " FROM license_files lf JOIN files f ON f.id = lf.file_id"
+            " ORDER BY lf.license_id, f.id").fetchall()
         conn.commit()
-        return [dict(r) for r in rows]
+        by_license = {}
+        for fr in file_rows:
+            by_license.setdefault(fr["license_id"], []).append(dict(fr))
+        result = []
+        for r in rows:
+            d = dict(r)
+            d["files"] = by_license.get(d["id"], [])
+            result.append(d)
+        return result
     finally:
         conn.close()
